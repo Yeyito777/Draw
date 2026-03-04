@@ -9,6 +9,8 @@
  *   Hold right button   — switch to eraser cursor
  *   Left click + right  — erase (restore original screenshot)
  *   Scroll wheel        — change brush size
+ *   Side button (up)    — undo last stroke
+ *   Side button (back)  — redo
  *   ESC / Ctrl+C        — quit
  *
  * The cursor is a separate 32-bit ARGB overlay window rendered
@@ -35,6 +37,7 @@
 #define BRUSH_MIN       1
 #define BRUSH_MAX       50
 #define ERASE_BORDER    2         /* white ring width when erasing  */
+#define MAX_UNDO        30        /* max undo / redo levels         */
 
 /* ── Globals ──────────────────────────────────────────────────── */
 static Display *dpy;
@@ -55,6 +58,12 @@ static int      prev_x = -1, prev_y = -1;
 static int      cur_x, cur_y;
 static int      brush_radius = BRUSH_INITIAL;
 static unsigned long px_red;
+
+/* Undo / redo stacks (full canvas snapshots) */
+static Pixmap   undo_stack[MAX_UNDO];
+static int      undo_count;
+static Pixmap   redo_stack[MAX_UNDO];
+static int      redo_count;
 
 /* Cached circular clip mask for the eraser */
 static Pixmap   erase_clip;
@@ -280,6 +289,58 @@ static void erase_stroke(int x0, int y0, int x1, int y1)
     }
 }
 
+/* ── Undo / redo ──────────────────────────────────────────────── */
+
+static Pixmap snapshot_canvas(void)
+{
+    int depth = DefaultDepth(dpy, screen_num);
+    Pixmap snap = XCreatePixmap(dpy, win, scr_w, scr_h, depth);
+    XCopyArea(dpy, canvas, snap, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
+    return snap;
+}
+
+static void push_stack(Pixmap *stack, int *count, Pixmap snap)
+{
+    if (*count >= MAX_UNDO) {
+        XFreePixmap(dpy, stack[0]);
+        memmove(&stack[0], &stack[1],
+                (size_t)(MAX_UNDO - 1) * sizeof(Pixmap));
+        (*count)--;
+    }
+    stack[(*count)++] = snap;
+}
+
+static void clear_stack(Pixmap *stack, int *count)
+{
+    for (int i = 0; i < *count; i++)
+        XFreePixmap(dpy, stack[i]);
+    *count = 0;
+}
+
+static void do_undo(void)
+{
+    if (undo_count == 0) return;
+    push_stack(redo_stack, &redo_count, snapshot_canvas());
+    undo_count--;
+    XCopyArea(dpy, undo_stack[undo_count], canvas, gc_copy,
+              0, 0, scr_w, scr_h, 0, 0);
+    XFreePixmap(dpy, undo_stack[undo_count]);
+    XCopyArea(dpy, canvas, win, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
+    XFlush(dpy);
+}
+
+static void do_redo(void)
+{
+    if (redo_count == 0) return;
+    push_stack(undo_stack, &undo_count, snapshot_canvas());
+    redo_count--;
+    XCopyArea(dpy, redo_stack[redo_count], canvas, gc_copy,
+              0, 0, scr_w, scr_h, 0, 0);
+    XFreePixmap(dpy, redo_stack[redo_count]);
+    XCopyArea(dpy, canvas, win, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
+    XFlush(dpy);
+}
+
 /* ── Blit a clamped rectangle from canvas to the window ───────── */
 static void blit_rect(int x, int y, int w, int h)
 {
@@ -436,6 +497,9 @@ int main(void)
                     stroking = 1;
                     prev_x   = ev.xbutton.x;
                     prev_y   = ev.xbutton.y;
+                    push_stack(undo_stack, &undo_count,
+                               snapshot_canvas());
+                    clear_stack(redo_stack, &redo_count);
                     if (erase_mode) {
                         erase_stamp(prev_x, prev_y);
                     } else {
@@ -467,6 +531,12 @@ int main(void)
                             brush_radius = BRUSH_MIN;
                         if (has_cursor) resize_cursor();
                     }
+                    break;
+                case 8: /* side button (back) = redo */
+                    if (!stroking) do_redo();
+                    break;
+                case 9: /* side button (up) = undo */
+                    if (!stroking) do_undo();
                     break;
                 }
                 break;
@@ -536,6 +606,8 @@ int main(void)
     /* ── Cleanup ────────────────────────────────────────────── */
     XUngrabPointer(dpy, CurrentTime);
     XUngrabKeyboard(dpy, CurrentTime);
+    clear_stack(undo_stack, &undo_count);
+    clear_stack(redo_stack, &redo_count);
     XFreeCursor(dpy, blank);
     XFreeGC(dpy, gc_draw);
     XFreeGC(dpy, gc_copy);
