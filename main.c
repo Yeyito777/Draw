@@ -5,7 +5,8 @@
  * draw / erase over it.
  *
  * Controls:
- *   Left  mouse button  — draw red
+ *   Left  mouse button  — draw (current colour)
+ *   1–9 keys            — switch colour
  *   Hold right button   — switch to eraser cursor
  *   Left click + right  — erase (restore original screenshot)
  *   Scroll wheel        — change brush size
@@ -57,7 +58,25 @@ static int      stroking;               /* left button held             */
 static int      prev_x = -1, prev_y = -1;
 static int      cur_x, cur_y;
 static int      brush_radius = BRUSH_INITIAL;
-static unsigned long px_red;
+
+/* Colour palette — index 0–8 correspond to keys 1–9 */
+#define NUM_COLORS 9
+static struct {
+    unsigned short r, g, b;       /* X colour (0–0xFFFF)            */
+    unsigned char  ar, ag, ab;    /* 0–255 for ARGB cursor          */
+} color_table[NUM_COLORS] = {
+    /* 1 */ { 0x0000, 0x0000, 0x0000,   0,   0,   0 },   /* black   */
+    /* 2 */ { 0xFFFF, 0x0000, 0x0000, 255,   0,   0 },   /* red     */
+    /* 3 */ { 0x0000, 0xC000, 0x0000,   0, 192,   0 },   /* green   */
+    /* 4 */ { 0x0000, 0x5555, 0xFFFF,   0,  85, 255 },   /* blue    */
+    /* 5 */ { 0xFFFF, 0xA500, 0x0000, 255, 165,   0 },   /* orange  */
+    /* 6 */ { 0xFFFF, 0xFFFF, 0x0000, 255, 255,   0 },   /* yellow  */
+    /* 7 */ { 0x8000, 0x0000, 0x8000, 128,   0, 128 },   /* purple  */
+    /* 8 */ { 0x0000, 0xFFFF, 0xFFFF,   0, 255, 255 },   /* cyan    */
+    /* 9 */ { 0xFFFF, 0xFFFF, 0xFFFF, 255, 255, 255 },   /* white   */
+};
+static int           cur_color = 1;   /* default = red (index 1)    */
+static unsigned long px_colors[NUM_COLORS];
 
 /* Undo / redo stacks (full canvas snapshots) */
 static Pixmap   undo_stack[MAX_UNDO];
@@ -81,14 +100,29 @@ static volatile sig_atomic_t running = 1;
 /* ── Signal handler ───────────────────────────────────────────── */
 static void on_sigint(int sig) { (void)sig; running = 0; }
 
-/* ── Colour helper ────────────────────────────────────────────── */
-static unsigned long alloc_red(void)
+static void resize_cursor(void);
+
+/* ── Colour helpers ───────────────────────────────────────────── */
+static void alloc_colors(void)
 {
-    XColor c;
-    c.red = 0xFFFF; c.green = 0; c.blue = 0;
-    c.flags = DoRed | DoGreen | DoBlue;
-    XAllocColor(dpy, DefaultColormap(dpy, screen_num), &c);
-    return c.pixel;
+    Colormap cmap = DefaultColormap(dpy, screen_num);
+    for (int i = 0; i < NUM_COLORS; i++) {
+        XColor c;
+        c.red   = color_table[i].r;
+        c.green = color_table[i].g;
+        c.blue  = color_table[i].b;
+        c.flags = DoRed | DoGreen | DoBlue;
+        XAllocColor(dpy, cmap, &c);
+        px_colors[i] = c.pixel;
+    }
+}
+
+static void set_color(int idx)
+{
+    cur_color = idx;
+    XSetForeground(dpy, gc_draw, px_colors[idx]);
+    if (has_cursor && !erase_mode)
+        resize_cursor();          /* repaint cursor in new colour */
 }
 
 /* ── Find a 32-bit ARGB TrueColor visual ─────────────────────── */
@@ -167,8 +201,11 @@ static void render_cursor(void)
             }
         }
     } else {
-        /* solid red filled circle */
+        /* solid filled circle in the current colour */
         float r = (float)brush_radius;
+        unsigned char cr = color_table[cur_color].ar;
+        unsigned char cg = color_table[cur_color].ag;
+        unsigned char cb = color_table[cur_color].ab;
 
         for (int y = 0; y < d; y++) {
             float dy  = y + 0.5f - center;
@@ -181,10 +218,16 @@ static void render_cursor(void)
                 if (cov <= 0.0f) continue;
                 if (cov > 1.0f)  cov = 1.0f;
 
-                unsigned a = (unsigned)(cov * 255.0f + 0.5f);
+                /* premultiplied ARGB */
+                unsigned a  = (unsigned)(cov * 255.0f + 0.5f);
+                unsigned rr = (unsigned)(cov * cr + 0.5f);
+                unsigned gg = (unsigned)(cov * cg + 0.5f);
+                unsigned bb = (unsigned)(cov * cb + 0.5f);
                 XPutPixel(img, x, y,
-                          ((unsigned long)a << 24) |
-                          ((unsigned long)a << 16));
+                          ((unsigned long)a  << 24) |
+                          ((unsigned long)rr << 16) |
+                          ((unsigned long)gg << 8)  |
+                           (unsigned long)bb);
             }
         }
     }
@@ -370,7 +413,7 @@ int main(void)
     root       = RootWindow(dpy, screen_num);
     scr_w      = DisplayWidth(dpy, screen_num);
     scr_h      = DisplayHeight(dpy, screen_num);
-    px_red     = alloc_red();
+    alloc_colors();
 
     /* ── Capture screenshot ─────────────────────────────────── */
     XImage *shot = XGetImage(dpy, root, 0, 0, scr_w, scr_h,
@@ -432,7 +475,7 @@ int main(void)
 
     /* ── GCs for drawing and erasing ────────────────────────── */
     gc_draw  = XCreateGC(dpy, canvas, 0, NULL);
-    XSetForeground(dpy, gc_draw, px_red);
+    XSetForeground(dpy, gc_draw, px_colors[cur_color]);
     gc_erase = XCreateGC(dpy, canvas, 0, NULL);
 
     /* ── Hide the real cursor ───────────────────────────────── */
@@ -488,6 +531,8 @@ int main(void)
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
                 if (ks == XK_Escape)
                     running = 0;
+                else if (ks >= XK_1 && ks <= XK_9)
+                    set_color((int)(ks - XK_1));
                 break;
             }
 
