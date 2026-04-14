@@ -26,12 +26,14 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/extensions/shape.h>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <unistd.h>
 
 /* ── Tunables ─────────────────────────────────────────────────── */
 #define BRUSH_INITIAL   5
@@ -441,6 +443,9 @@ int main(void)
             CWOverrideRedirect | CWColormap |
             CWBackPixel        | CWBorderPixel,
             &cwa);
+        /* Make the visual cursor overlay click-through. */
+        XShapeCombineRectangles(dpy, cursor_win, ShapeInput,
+                                0, 0, NULL, 0, ShapeSet, Unsorted);
         gc_cursor = XCreateGC(dpy, cursor_win, 0, NULL);
         XClassHint cch = { .res_name = "draw", .res_class = "draw" };
         XSetClassHint(dpy, cursor_win, &cch);
@@ -491,12 +496,15 @@ int main(void)
     if (has_cursor)
         XRaiseWindow(dpy, cursor_win);
 
-    /* ── Grab input ─────────────────────────────────────────── */
-    XGrabKeyboard(dpy, win, True,
-                  GrabModeAsync, GrabModeAsync, CurrentTime);
-    XGrabPointer(dpy, win, True,
-                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
-                 GrabModeAsync, GrabModeAsync, win, None, CurrentTime);
+    /* ── Take focus, but avoid active grabs ─────────────────── */
+    /*
+     * Draw already sits in a fullscreen override-redirect window, so it can
+     * receive pointer events without grabbing the pointer. Likewise, setting
+     * input focus is enough for its plain key controls (Esc, 1–9) while still
+     * letting dwm's passive global hotkeys fire. This keeps Draw compatible
+     * with other tools such as dmenu and maim/slop.
+     */
+    XSetInputFocus(dpy, win, RevertToPointerRoot, CurrentTime);
 
     /* ── Initial cursor placement ───────────────────────────── */
     {
