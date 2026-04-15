@@ -98,11 +98,42 @@ static GC       gc_cursor;
 static int      has_cursor;
 
 static volatile sig_atomic_t running = 1;
+static Window saved_focus = None;
+static int    saved_focus_revert = RevertToPointerRoot;
 
 /* ── Signal handler ───────────────────────────────────────────── */
 static void on_sigint(int sig) { (void)sig; running = 0; }
 
 static void resize_cursor(void);
+
+static int
+ignore_xerror(Display *unused_dpy, XErrorEvent *unused_err)
+{
+    (void)unused_dpy;
+    (void)unused_err;
+    return 0;
+}
+
+/*
+ * Draw explicitly focuses its fullscreen override-redirect window so ESC and
+ * the 1–9 palette shortcuts work without a keyboard grab. Remember the window
+ * that was focused before Draw started and restore it once Draw exits so the
+ * previously active client does not get stranded at PointerRoot.
+ */
+static void
+restore_saved_focus(void)
+{
+    int (*old_handler)(Display *, XErrorEvent *);
+
+    if (!saved_focus || saved_focus == None || saved_focus == PointerRoot ||
+        saved_focus == win || (has_cursor && saved_focus == cursor_win))
+        return;
+
+    old_handler = XSetErrorHandler(ignore_xerror);
+    XSetInputFocus(dpy, saved_focus, saved_focus_revert, CurrentTime);
+    XSync(dpy, False);
+    XSetErrorHandler(old_handler);
+}
 
 /* ── Colour helpers ───────────────────────────────────────────── */
 static void alloc_colors(void)
@@ -503,7 +534,10 @@ int main(void)
      * input focus is enough for its plain key controls (Esc, 1–9) while still
      * letting dwm's passive global hotkeys fire. This keeps Draw compatible
      * with other tools such as dmenu and maim/slop.
+     *
+     * Save the previously focused window first so we can restore it on exit.
      */
+    XGetInputFocus(dpy, &saved_focus, &saved_focus_revert);
     XSetInputFocus(dpy, win, RevertToPointerRoot, CurrentTime);
 
     /* ── Initial cursor placement ───────────────────────────── */
@@ -675,6 +709,8 @@ int main(void)
     XFreePixmap(dpy, original);
     XFreePixmap(dpy, canvas);
     XDestroyWindow(dpy, win);
+    XSync(dpy, False);
+    restore_saved_focus();
     XCloseDisplay(dpy);
 
     return 0;
