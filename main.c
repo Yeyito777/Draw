@@ -101,6 +101,9 @@ static volatile sig_atomic_t running = 1;
 static Window saved_focus = None;
 static int    saved_focus_revert = RevertToPointerRoot;
 
+#define FOCUS_TIMEOUT_US 1000000
+#define FOCUS_RETRY_US      5000
+
 /* ── Signal handler ───────────────────────────────────────────── */
 static void on_sigint(int sig) { (void)sig; running = 0; }
 
@@ -111,6 +114,26 @@ ignore_xerror(Display *unused_dpy, XErrorEvent *unused_err)
 {
     (void)unused_dpy;
     (void)unused_err;
+    return 0;
+}
+
+static int
+focus_window(Window target, int revert_to)
+{
+    Window focused;
+    int revert;
+    useconds_t waited = 0;
+
+    while (waited <= FOCUS_TIMEOUT_US) {
+        XSetInputFocus(dpy, target, revert_to, CurrentTime);
+        XSync(dpy, False);
+        XGetInputFocus(dpy, &focused, &revert);
+        if (focused == target)
+            return 1;
+        usleep(FOCUS_RETRY_US);
+        waited += FOCUS_RETRY_US;
+    }
+
     return 0;
 }
 
@@ -130,8 +153,7 @@ restore_saved_focus(void)
         return;
 
     old_handler = XSetErrorHandler(ignore_xerror);
-    XSetInputFocus(dpy, saved_focus, saved_focus_revert, CurrentTime);
-    XSync(dpy, False);
+    focus_window(saved_focus, saved_focus_revert);
     XSetErrorHandler(old_handler);
 }
 
@@ -538,7 +560,7 @@ int main(void)
      * Save the previously focused window first so we can restore it on exit.
      */
     XGetInputFocus(dpy, &saved_focus, &saved_focus_revert);
-    XSetInputFocus(dpy, win, RevertToPointerRoot, CurrentTime);
+    focus_window(win, RevertToPointerRoot);
 
     /* ── Initial cursor placement ───────────────────────────── */
     {
