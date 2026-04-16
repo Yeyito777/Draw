@@ -103,6 +103,7 @@ static int    saved_focus_revert = RevertToPointerRoot;
 
 #define FOCUS_TIMEOUT_US 1000000
 #define FOCUS_RETRY_US      5000
+#define FOCUS_SETTLE_US    50000
 
 /* ── Signal handler ───────────────────────────────────────────── */
 static void on_sigint(int sig) { (void)sig; running = 0; }
@@ -135,6 +136,48 @@ focus_window(Window target, int revert_to)
     }
 
     return 0;
+}
+
+static int
+focus_should_return_to_draw(void)
+{
+    Window focused;
+    int revert;
+    XWindowAttributes attr;
+    int (*old_handler)(Display *, XErrorEvent *);
+    Status ok;
+
+    XGetInputFocus(dpy, &focused, &revert);
+    if (focused == win)
+        return 0;
+    if (focused == None || focused == PointerRoot)
+        return 1;
+    if (has_cursor && focused == cursor_win)
+        return 0;
+
+    old_handler = XSetErrorHandler(ignore_xerror);
+    ok = XGetWindowAttributes(dpy, focused, &attr);
+    XSync(dpy, False);
+    XSetErrorHandler(old_handler);
+    if (!ok)
+        return 1;
+
+    /*
+     * If another override-redirect or input-only helper currently owns focus
+     * (for example another overlay tool), do not steal it back.
+     */
+    if (attr.override_redirect || attr.class == InputOnly)
+        return 0;
+
+    return 1;
+}
+
+static void
+reclaim_focus_if_needed(void)
+{
+    usleep(FOCUS_SETTLE_US);
+    if (focus_should_return_to_draw())
+        focus_window(win, RevertToPointerRoot);
 }
 
 /*
@@ -512,9 +555,10 @@ int main(void)
     /* ── Fullscreen window ──────────────────────────────────── */
     XSetWindowAttributes wa = {
         .override_redirect = True,
-        .event_mask = ExposureMask      | KeyPressMask      |
+        .event_mask = ExposureMask      | KeyPressMask       |
                       ButtonPressMask   | ButtonReleaseMask  |
-                      PointerMotionMask | StructureNotifyMask,
+                      PointerMotionMask | StructureNotifyMask |
+                      FocusChangeMask,
     };
     win = XCreateWindow(dpy, root, 0, 0, scr_w, scr_h, 0,
                         CopyFromParent, InputOutput, CopyFromParent,
@@ -660,6 +704,10 @@ int main(void)
                     prev_x = prev_y = -1;
                     if (has_cursor) resize_cursor();
                 }
+                break;
+
+            case FocusOut:
+                reclaim_focus_if_needed();
                 break;
 
             case MotionNotify: {
