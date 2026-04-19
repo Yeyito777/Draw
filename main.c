@@ -5,14 +5,16 @@
  * draw / erase over it.
  *
  * Controls:
- *   Left  mouse button  — draw (current colour)
- *   1–9 keys            — switch colour
- *   Hold right button   — switch to eraser cursor
- *   Left click + right  — erase (restore original screenshot)
- *   Scroll wheel        — change brush size
- *   Side button (up)    — undo last stroke
- *   Side button (back)  — redo
- *   ESC / Ctrl+C        — quit
+ *   Left  mouse button      — draw (current colour)
+ *   1–9 keys                — switch colour
+ *   Ctrl+1..9               — save drawing slot
+ *   Ctrl+Shift+1..9         — load drawing slot
+ *   Hold right button       — switch to eraser cursor
+ *   Left click + right      — erase (restore original screenshot)
+ *   Scroll wheel            — change brush size
+ *   Side button (up)        — undo last stroke
+ *   Side button (back)      — redo
+ *   ESC / Ctrl+C            — quit
  *
  * The cursor is a separate 32-bit ARGB overlay window rendered
  * with per-pixel anti-aliasing.  The compositor alpha-blends it
@@ -27,20 +29,26 @@
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <X11/extensions/shape.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 /* ── Tunables ─────────────────────────────────────────────────── */
-#define BRUSH_INITIAL   5
-#define BRUSH_MIN       1
-#define BRUSH_MAX       50
-#define ERASE_BORDER    2         /* white ring width when erasing  */
-#define MAX_UNDO        30        /* max undo / redo levels         */
+#define BRUSH_INITIAL    5
+#define BRUSH_MIN        1
+#define BRUSH_MAX        50
+#define ERASE_BORDER     2        /* white ring width when erasing  */
+#define MAX_UNDO         30       /* max undo / redo levels         */
+#define SLOT_FILE_VERSION 1
 
 /* ── Globals ──────────────────────────────────────────────────── */
 static Display *dpy;
@@ -80,11 +88,19 @@ static struct {
 static int           cur_color = 1;   /* default = red (index 1)    */
 static unsigned long px_colors[NUM_COLORS];
 
-/* Undo / redo stacks (full canvas snapshots) */
-static Pixmap   undo_stack[MAX_UNDO];
-static int      undo_count;
-static Pixmap   redo_stack[MAX_UNDO];
-static int      redo_count;
+/* Persistent annotation layer: 0 = empty, 1–NUM_COLORS = palette entry + 1 */
+static uint8_t *overlay_map;
+
+typedef struct {
+    Pixmap   pixmap;
+    uint8_t *overlay;
+} CanvasSnapshot;
+
+/* Undo / redo stacks (canvas snapshots + overlay state) */
+static CanvasSnapshot undo_stack[MAX_UNDO];
+static int            undo_count;
+static CanvasSnapshot redo_stack[MAX_UNDO];
+static int            redo_count;
 
 /* Cached circular clip mask for the eraser */
 static Pixmap   erase_clip;
@@ -221,6 +237,385 @@ static void set_color(int idx)
     XSetForeground(dpy, gc_draw, px_colors[idx]);
     if (has_cursor && !erase_mode)
         resize_cursor();          /* repaint cursor in new colour */
+}
+
+
+static size_t overlay_size(void)
+{
+    return (size_t)scr_w * (size_t)scr_h;
+}
+
+static int snapshot_valid(const CanvasSnapshot *snap)
+{
+    return snap->pixmap != None && snap->overlay != NULL;
+}
+
+static void free_snapshot(CanvasSnapshot *snap)
+{
+    if (snap->pixmap != None)
+        XFreePixmap(dpy, snap->pixmap);
+    free(snap->overlay);
+    snap->pixmap = None;
+    snap->overlay = NULL;
+}
+
+static CanvasSnapshot snapshot_canvas(void)
+{
+    CanvasSnapshot snap = {0};
+    size_t bytes = overlay_size();
+    int depth = DefaultDepth(dpy, screen_num);
+
+    snap.pixmap = XCreatePixmap(dpy, win, scr_w, scr_h, depth);
+    if (snap.pixmap != None)
+        XCopyArea(dpy, canvas, snap.pixmap, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
+
+    snap.overlay = malloc(bytes);
+    if (!snap.overlay) {
+        free_snapshot(&snap);
+        return (CanvasSnapshot){0};
+    }
+
+    memcpy(snap.overlay, overlay_map, bytes);
+    return snap;
+}
+
+static void push_stack(CanvasSnapshot *stack, int *count, CanvasSnapshot *snap)
+{
+    if (!snapshot_valid(snap)) {
+        free_snapshot(snap);
+        return;
+    }
+
+    if (*count >= MAX_UNDO) {
+        free_snapshot(&stack[0]);
+        memmove(&stack[0], &stack[1],
+                (size_t)(MAX_UNDO - 1) * sizeof(*stack));
+        (*count)--;
+    }
+
+    stack[(*count)++] = *snap;
+    *snap = (CanvasSnapshot){0};
+}
+
+static void clear_stack(CanvasSnapshot *stack, int *count)
+{
+    for (int i = 0; i < *count; i++)
+        free_snapshot(&stack[i]);
+    *count = 0;
+}
+
+static void restore_snapshot(const CanvasSnapshot *snap)
+{
+    if (!snapshot_valid(snap))
+        return;
+
+    XCopyArea(dpy, snap->pixmap, canvas, gc_copy,
+              0, 0, scr_w, scr_h, 0, 0);
+    memcpy(overlay_map, snap->overlay, overlay_size());
+}
+
+static int slot_from_keysym(KeySym ks)
+{
+    switch (ks) {
+    case XK_1:
+    case XK_KP_1:
+        return 1;
+    case XK_2:
+    case XK_KP_2:
+        return 2;
+    case XK_3:
+    case XK_KP_3:
+        return 3;
+    case XK_4:
+    case XK_KP_4:
+        return 4;
+    case XK_5:
+    case XK_KP_5:
+        return 5;
+    case XK_6:
+    case XK_KP_6:
+        return 6;
+    case XK_7:
+    case XK_KP_7:
+        return 7;
+    case XK_8:
+    case XK_KP_8:
+        return 8;
+    case XK_9:
+    case XK_KP_9:
+        return 9;
+    default:
+        return 0;
+    }
+}
+
+static char *build_data_path(const char *suffix)
+{
+    const char *xdg = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+    int needed;
+    char *path;
+
+    if (xdg && xdg[0] != '\0')
+        needed = snprintf(NULL, 0, "%s/%s", xdg, suffix);
+    else if (home && home[0] != '\0')
+        needed = snprintf(NULL, 0, "%s/.local/share/%s", home, suffix);
+    else
+        return NULL;
+
+    if (needed < 0)
+        return NULL;
+
+    path = malloc((size_t)needed + 1);
+    if (!path)
+        return NULL;
+
+    if (xdg && xdg[0] != '\0')
+        snprintf(path, (size_t)needed + 1, "%s/%s", xdg, suffix);
+    else
+        snprintf(path, (size_t)needed + 1, "%s/.local/share/%s", home, suffix);
+
+    return path;
+}
+
+static int ensure_dir(const char *path)
+{
+    struct stat st;
+
+    if (mkdir(path, 0700) == 0)
+        return 1;
+    if (errno != EEXIST) {
+        fprintf(stderr, "draw: failed to create %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+        return 1;
+
+    fprintf(stderr, "draw: %s exists but is not a directory\n", path);
+    return 0;
+}
+
+static int ensure_slot_dir(void)
+{
+    char *draw_dir = build_data_path("draw");
+    char *slots_dir = build_data_path("draw/slots");
+    int ok = 0;
+
+    if (!draw_dir || !slots_dir) {
+        fprintf(stderr, "draw: failed to resolve data directory\n");
+        goto out;
+    }
+
+    if (!ensure_dir(draw_dir) || !ensure_dir(slots_dir))
+        goto out;
+
+    ok = 1;
+out:
+    free(draw_dir);
+    free(slots_dir);
+    return ok;
+}
+
+static char *slot_file_path(int slot)
+{
+    char rel[64];
+    snprintf(rel, sizeof rel, "draw/slots/slot-%d.drawslot", slot);
+    return build_data_path(rel);
+}
+
+static int write_u32_le(FILE *fp, uint32_t value)
+{
+    unsigned char buf[4] = {
+        (unsigned char)(value & 0xFFu),
+        (unsigned char)((value >> 8) & 0xFFu),
+        (unsigned char)((value >> 16) & 0xFFu),
+        (unsigned char)((value >> 24) & 0xFFu),
+    };
+    return fwrite(buf, 1, sizeof buf, fp) == sizeof buf;
+}
+
+static int read_u32_le(FILE *fp, uint32_t *value)
+{
+    unsigned char buf[4];
+
+    if (fread(buf, 1, sizeof buf, fp) != sizeof buf)
+        return 0;
+
+    *value = (uint32_t)buf[0]
+           | ((uint32_t)buf[1] << 8)
+           | ((uint32_t)buf[2] << 16)
+           | ((uint32_t)buf[3] << 24);
+    return 1;
+}
+
+static int rebuild_canvas_from_overlay(void)
+{
+    XImage *img = XGetImage(dpy, original, 0, 0, scr_w, scr_h,
+                            AllPlanes, ZPixmap);
+    if (!img) {
+        fprintf(stderr, "draw: failed to rebuild canvas from overlay\n");
+        return 0;
+    }
+
+    for (int y = 0; y < scr_h; y++) {
+        size_t row = (size_t)y * (size_t)scr_w;
+        for (int x = 0; x < scr_w; x++) {
+            uint8_t px = overlay_map[row + (size_t)x];
+            if (px != 0)
+                XPutPixel(img, x, y, px_colors[px - 1]);
+        }
+    }
+
+    XPutImage(dpy, canvas, gc_copy, img, 0, 0, 0, 0, scr_w, scr_h);
+    XDestroyImage(img);
+    return 1;
+}
+
+static int save_slot(int slot)
+{
+    static const unsigned char magic[8] = { 'D', 'R', 'W', 'S', 'L', 'T', '0', '1' };
+    char *path = NULL;
+    FILE *fp = NULL;
+    size_t bytes = overlay_size();
+    int ok = 0;
+
+    if (!ensure_slot_dir())
+        goto out;
+
+    path = slot_file_path(slot);
+    if (!path) {
+        fprintf(stderr, "draw: failed to build slot path\n");
+        goto out;
+    }
+
+    fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "draw: failed to open %s for writing: %s\n",
+                path, strerror(errno));
+        goto out;
+    }
+
+    if (fwrite(magic, 1, sizeof magic, fp) != sizeof magic
+        || !write_u32_le(fp, SLOT_FILE_VERSION)
+        || !write_u32_le(fp, (uint32_t)scr_w)
+        || !write_u32_le(fp, (uint32_t)scr_h)
+        || fwrite(overlay_map, 1, bytes, fp) != bytes) {
+        fprintf(stderr, "draw: failed to write %s\n", path);
+        goto out;
+    }
+
+    if (fclose(fp) != 0) {
+        fp = NULL;
+        fprintf(stderr, "draw: failed to close %s: %s\n",
+                path, strerror(errno));
+        goto out;
+    }
+    fp = NULL;
+
+    fprintf(stderr, "draw: saved slot %d to %s\n", slot, path);
+    ok = 1;
+
+out:
+    if (fp)
+        fclose(fp);
+    if (!ok && path)
+        unlink(path);
+    free(path);
+    return ok;
+}
+
+static int load_slot(int slot)
+{
+    static const unsigned char magic[8] = { 'D', 'R', 'W', 'S', 'L', 'T', '0', '1' };
+    char *path = NULL;
+    FILE *fp = NULL;
+    unsigned char file_magic[sizeof magic];
+    uint32_t version, width, height;
+    size_t dst_bytes = overlay_size();
+    size_t src_bytes;
+    size_t copy_w, copy_h;
+    uint8_t *loaded = NULL;
+    uint8_t *src = NULL;
+    uint8_t *old_overlay = NULL;
+    CanvasSnapshot before = {0};
+    int ok = 0;
+
+    path = slot_file_path(slot);
+    if (!path) {
+        fprintf(stderr, "draw: failed to build slot path\n");
+        goto out;
+    }
+
+    fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "draw: failed to open %s: %s\n",
+                path, strerror(errno));
+        goto out;
+    }
+
+    if (fread(file_magic, 1, sizeof file_magic, fp) != sizeof file_magic
+        || memcmp(file_magic, magic, sizeof magic) != 0
+        || !read_u32_le(fp, &version)
+        || !read_u32_le(fp, &width)
+        || !read_u32_le(fp, &height)) {
+        fprintf(stderr, "draw: invalid slot file %s\n", path);
+        goto out;
+    }
+
+    if (version != SLOT_FILE_VERSION || width == 0 || height == 0) {
+        fprintf(stderr, "draw: unsupported slot file %s\n", path);
+        goto out;
+    }
+    if ((size_t)width > SIZE_MAX / (size_t)height) {
+        fprintf(stderr, "draw: slot file %s is too large\n", path);
+        goto out;
+    }
+
+    src_bytes = (size_t)width * (size_t)height;
+    src = malloc(src_bytes);
+    loaded = calloc(dst_bytes, 1);
+    old_overlay = malloc(dst_bytes);
+    if (!src || !loaded || !old_overlay) {
+        fprintf(stderr, "draw: out of memory loading slot %d\n", slot);
+        goto out;
+    }
+
+    if (fread(src, 1, src_bytes, fp) != src_bytes) {
+        fprintf(stderr, "draw: failed to read %s\n", path);
+        goto out;
+    }
+
+    copy_w = (size_t)width < (size_t)scr_w ? (size_t)width : (size_t)scr_w;
+    copy_h = (size_t)height < (size_t)scr_h ? (size_t)height : (size_t)scr_h;
+    for (size_t y = 0; y < copy_h; y++)
+        memcpy(&loaded[y * (size_t)scr_w], &src[y * (size_t)width], copy_w);
+
+    memcpy(old_overlay, overlay_map, dst_bytes);
+    before = snapshot_canvas();
+    memcpy(overlay_map, loaded, dst_bytes);
+    if (!rebuild_canvas_from_overlay()) {
+        memcpy(overlay_map, old_overlay, dst_bytes);
+        goto out;
+    }
+
+    push_stack(undo_stack, &undo_count, &before);
+    clear_stack(redo_stack, &redo_count);
+
+    XCopyArea(dpy, canvas, win, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
+    XFlush(dpy);
+    fprintf(stderr, "draw: loaded slot %d from %s\n", slot, path);
+    ok = 1;
+
+out:
+    if (fp)
+        fclose(fp);
+    free_snapshot(&before);
+    free(old_overlay);
+    free(src);
+    free(loaded);
+    free(path);
+    return ok;
 }
 
 /* ── Find a 32-bit ARGB TrueColor visual ─────────────────────── */
@@ -363,8 +758,34 @@ static Cursor make_blank_cursor(void)
 }
 
 /* ── Drawing helpers ──────────────────────────────────────────── */
+static void overlay_paint_circle(int x, int y, uint8_t value)
+{
+    int r = brush_radius;
+    int min_x = x - r;
+    int max_x = x + r;
+    int min_y = y - r;
+    int max_y = y + r;
+    int rr = r * r;
+
+    if (min_x < 0) min_x = 0;
+    if (min_y < 0) min_y = 0;
+    if (max_x >= scr_w) max_x = scr_w - 1;
+    if (max_y >= scr_h) max_y = scr_h - 1;
+
+    for (int py = min_y; py <= max_y; py++) {
+        int dy = py - y;
+        size_t row = (size_t)py * (size_t)scr_w;
+        for (int px = min_x; px <= max_x; px++) {
+            int dx = px - x;
+            if (dx * dx + dy * dy <= rr)
+                overlay_map[row + (size_t)px] = value;
+        }
+    }
+}
+
 static void brush_stamp(int x, int y)
 {
+    overlay_paint_circle(x, y, (uint8_t)(cur_color + 1));
     XFillArc(dpy, canvas, gc_draw,
              x - brush_radius, y - brush_radius,
              brush_radius * 2, brush_radius * 2,
@@ -409,6 +830,7 @@ static void update_erase_clip(void)
 
 static void erase_stamp(int x, int y)
 {
+    overlay_paint_circle(x, y, 0);
     update_erase_clip();
     int d = brush_radius * 2;
     int ox = x - brush_radius;
@@ -432,52 +854,30 @@ static void erase_stroke(int x0, int y0, int x1, int y1)
 
 /* ── Undo / redo ──────────────────────────────────────────────── */
 
-static Pixmap snapshot_canvas(void)
-{
-    int depth = DefaultDepth(dpy, screen_num);
-    Pixmap snap = XCreatePixmap(dpy, win, scr_w, scr_h, depth);
-    XCopyArea(dpy, canvas, snap, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
-    return snap;
-}
-
-static void push_stack(Pixmap *stack, int *count, Pixmap snap)
-{
-    if (*count >= MAX_UNDO) {
-        XFreePixmap(dpy, stack[0]);
-        memmove(&stack[0], &stack[1],
-                (size_t)(MAX_UNDO - 1) * sizeof(Pixmap));
-        (*count)--;
-    }
-    stack[(*count)++] = snap;
-}
-
-static void clear_stack(Pixmap *stack, int *count)
-{
-    for (int i = 0; i < *count; i++)
-        XFreePixmap(dpy, stack[i]);
-    *count = 0;
-}
-
 static void do_undo(void)
 {
+    CanvasSnapshot current;
+
     if (undo_count == 0) return;
-    push_stack(redo_stack, &redo_count, snapshot_canvas());
+    current = snapshot_canvas();
+    push_stack(redo_stack, &redo_count, &current);
     undo_count--;
-    XCopyArea(dpy, undo_stack[undo_count], canvas, gc_copy,
-              0, 0, scr_w, scr_h, 0, 0);
-    XFreePixmap(dpy, undo_stack[undo_count]);
+    restore_snapshot(&undo_stack[undo_count]);
+    free_snapshot(&undo_stack[undo_count]);
     XCopyArea(dpy, canvas, win, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
     XFlush(dpy);
 }
 
 static void do_redo(void)
 {
+    CanvasSnapshot current;
+
     if (redo_count == 0) return;
-    push_stack(undo_stack, &undo_count, snapshot_canvas());
+    current = snapshot_canvas();
+    push_stack(undo_stack, &undo_count, &current);
     redo_count--;
-    XCopyArea(dpy, redo_stack[redo_count], canvas, gc_copy,
-              0, 0, scr_w, scr_h, 0, 0);
-    XFreePixmap(dpy, redo_stack[redo_count]);
+    restore_snapshot(&redo_stack[redo_count]);
+    free_snapshot(&redo_stack[redo_count]);
     XCopyArea(dpy, canvas, win, gc_copy, 0, 0, scr_w, scr_h, 0, 0);
     XFlush(dpy);
 }
@@ -512,6 +912,13 @@ int main(void)
     scr_w      = DisplayWidth(dpy, screen_num);
     scr_h      = DisplayHeight(dpy, screen_num);
     alloc_colors();
+
+    overlay_map = calloc(overlay_size(), 1);
+    if (!overlay_map) {
+        fprintf(stderr, "error: failed to allocate drawing layer\n");
+        XCloseDisplay(dpy);
+        return 1;
+    }
 
     /* ── Capture screenshot ─────────────────────────────────── */
     XImage *shot = XGetImage(dpy, root, 0, 0, scr_w, scr_h,
@@ -636,11 +1043,20 @@ int main(void)
                 break;
 
             case KeyPress: {
+                unsigned int mods = ev.xkey.state;
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
-                if (ks == XK_Escape)
+                int slot = slot_from_keysym(ks);
+
+                if (ks == XK_Escape || ((mods & ControlMask) && ks == XK_c)) {
                     running = 0;
-                else if (ks >= XK_1 && ks <= XK_9)
-                    set_color((int)(ks - XK_1));
+                } else if ((mods & ControlMask) && slot != 0) {
+                    if (mods & ShiftMask)
+                        load_slot(slot);
+                    else
+                        save_slot(slot);
+                } else if (!(mods & ControlMask) && slot != 0) {
+                    set_color(slot - 1);
+                }
                 break;
             }
 
@@ -650,8 +1066,10 @@ int main(void)
                     stroking = 1;
                     prev_x   = ev.xbutton.x;
                     prev_y   = ev.xbutton.y;
-                    push_stack(undo_stack, &undo_count,
-                               snapshot_canvas());
+                    {
+                        CanvasSnapshot before = snapshot_canvas();
+                        push_stack(undo_stack, &undo_count, &before);
+                    }
                     clear_stack(redo_stack, &redo_count);
                     if (erase_mode) {
                         erase_stamp(prev_x, prev_y);
@@ -776,6 +1194,7 @@ int main(void)
         XDestroyWindow(dpy, cursor_win);
         XFreeColormap(dpy, argb_cmap);
     }
+    free(overlay_map);
     XFreePixmap(dpy, original);
     XFreePixmap(dpy, canvas);
     XDestroyWindow(dpy, win);

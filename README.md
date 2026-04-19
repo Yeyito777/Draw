@@ -20,13 +20,19 @@ compositor (picom, KWin, Mutter, etc.) for the anti-aliased cursor overlay.
 ./draw
 ```
 
-| Input              | Action           |
-|--------------------|------------------|
-| Left mouse button  | Draw (hold)      |
-| Scroll up          | Increase brush   |
-| Scroll down        | Decrease brush   |
-| ESC                | Quit             |
-| Ctrl+C             | Quit             |
+| Input               | Action                         |
+|---------------------|--------------------------------|
+| Left mouse button   | Draw (hold)                    |
+| 1–9                 | Switch colour                  |
+| Ctrl+1..9           | Save drawing slot              |
+| Ctrl+Shift+1..9     | Load drawing slot              |
+| Right mouse button  | Hold to erase                  |
+| Scroll up           | Increase brush                 |
+| Scroll down         | Decrease brush                 |
+| Side button (up)    | Undo                           |
+| Side button (back)  | Redo                           |
+| ESC                 | Quit                           |
+| Ctrl+C              | Quit                           |
 
 ## How it works
 
@@ -47,6 +53,8 @@ compositor (picom, KWin, Mutter, etc.) for the anti-aliased cursor overlay.
 - A compositor (picom, KWin, Mutter …) is required for the transparent,
   anti-aliased cursor overlay.  Without one the cursor may appear as a
   solid rectangle.
+- Saved drawing slots live under `$XDG_DATA_HOME/draw/slots/`, falling back to
+  `~/.local/share/draw/slots/` when `XDG_DATA_HOME` is unset.
 - This is an X11 tool. On Wayland-only sessions, `XGetImage` on the root window
   may return a blank image (an XWayland limitation). Run under an X11 session
   or Xwayland-compatible compositor for full functionality.
