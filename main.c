@@ -40,15 +40,18 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ── Tunables ─────────────────────────────────────────────────── */
-#define BRUSH_INITIAL    5
-#define BRUSH_MIN        1
-#define BRUSH_MAX        50
-#define ERASE_BORDER     2        /* white ring width when erasing  */
-#define MAX_UNDO         30       /* max undo / redo levels         */
-#define SLOT_FILE_VERSION 1
+#define BRUSH_INITIAL      5
+#define BRUSH_MIN          1
+#define BRUSH_MAX          50
+#define ERASE_BORDER       2      /* white ring width when erasing  */
+#define MAX_UNDO           30     /* max undo / redo levels         */
+#define SLOT_FILE_VERSION  1
+#define CURSOR_FEEDBACK_MS 1000
+#define CURSOR_FEEDBACK_PAD 4
 
 /* ── Globals ──────────────────────────────────────────────────── */
 static Display *dpy;
@@ -112,6 +115,12 @@ static Colormap argb_cmap;
 static Window   cursor_win;
 static GC       gc_cursor;
 static int      has_cursor;
+
+/* Cursor-centred save / load feedback */
+static XFontStruct *cursor_feedback_font;
+static int         cursor_feedback_slot;
+static unsigned long cursor_feedback_pixel;
+static long long   cursor_feedback_until_ms;
 
 static volatile sig_atomic_t running = 1;
 static Window saved_focus = None;
@@ -239,6 +248,47 @@ static void set_color(int idx)
         resize_cursor();          /* repaint cursor in new colour */
 }
 
+static long long now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
+}
+
+static int cursor_feedback_active(void)
+{
+    return cursor_feedback_slot != 0
+        && now_ms() < cursor_feedback_until_ms;
+}
+
+static unsigned long argb_pixel(unsigned char r, unsigned char g, unsigned char b)
+{
+    return ((unsigned long)0xFF << 24)
+         | ((unsigned long)r << 16)
+         | ((unsigned long)g << 8)
+         |  (unsigned long)b;
+}
+
+static void show_cursor_feedback(int slot, unsigned long pixel)
+{
+    if (!has_cursor || !cursor_feedback_font)
+        return;
+
+    cursor_feedback_slot = slot;
+    cursor_feedback_pixel = pixel;
+    cursor_feedback_until_ms = now_ms() + CURSOR_FEEDBACK_MS;
+    resize_cursor();
+}
+
+static void clear_cursor_feedback_if_needed(void)
+{
+    if (cursor_feedback_slot == 0 || cursor_feedback_active())
+        return;
+
+    cursor_feedback_slot = 0;
+    resize_cursor();
+}
 
 static size_t overlay_size(void)
 {
@@ -522,6 +572,8 @@ out:
     if (!ok && path)
         unlink(path);
     free(path);
+    show_cursor_feedback(slot, ok ? argb_pixel(0, 255, 0)
+                                  : argb_pixel(255, 64, 64));
     return ok;
 }
 
@@ -615,6 +667,8 @@ out:
     free(src);
     free(loaded);
     free(path);
+    show_cursor_feedback(slot, ok ? argb_pixel(0, 255, 255)
+                               : argb_pixel(255, 64, 64));
     return ok;
 }
 
@@ -646,87 +700,133 @@ static Visual *find_argb_visual(void)
  *    erase — transparent interior + white ring border             *
  * ─────────────────────────────────────────────────────────────── */
 
+static int feedback_cursor_size(void)
+{
+    char text[2] = { (char)('0' + cursor_feedback_slot), '\0' };
+    int text_w;
+    int text_h;
+    int d;
+
+    if (!cursor_feedback_active() || !cursor_feedback_font)
+        return 0;
+
+    text_w = XTextWidth(cursor_feedback_font, text, 1);
+    text_h = cursor_feedback_font->ascent + cursor_feedback_font->descent;
+    d = text_w > text_h ? text_w : text_h;
+    return d + CURSOR_FEEDBACK_PAD * 2;
+}
+
 static int cursor_diameter(void)
 {
-    int border = erase_mode ? ERASE_BORDER : 0;
-    return (brush_radius + border) * 2 + 2;        /* +2 AA fringe */
+    int feedback_d = feedback_cursor_size();
+
+    if (feedback_d > 0)
+        return feedback_d;
+
+    {
+        int border = erase_mode ? ERASE_BORDER : 0;
+        return (brush_radius + border) * 2 + 2;        /* +2 AA fringe */
+    }
 }
 
 static void render_cursor(void)
 {
-    int   d      = cursor_diameter();
-    float center = d * 0.5f;
+    int d = cursor_diameter();
 
-    XImage *img = XCreateImage(dpy, argb_visual, 32, ZPixmap,
-                               0, NULL, d, d, 32, 0);
-    img->data = calloc((size_t)img->bytes_per_line * d, 1);
+    if (cursor_feedback_active() && cursor_feedback_font) {
+        char text[2] = { (char)('0' + cursor_feedback_slot), '\0' };
+        int text_w = XTextWidth(cursor_feedback_font, text, 1);
+        int text_h = cursor_feedback_font->ascent + cursor_feedback_font->descent;
+        int x = (d - text_w) / 2;
+        int y = (d - text_h) / 2 + cursor_feedback_font->ascent;
 
-    if (erase_mode) {
-        /* transparent inside, anti-aliased white ring outside */
-        float r_inner = (float)brush_radius;
-        float r_outer = (float)(brush_radius + ERASE_BORDER);
-
-        for (int y = 0; y < d; y++) {
-            float dy  = y + 0.5f - center;
-            float dy2 = dy * dy;
-            for (int x = 0; x < d; x++) {
-                float dx   = x + 0.5f - center;
-                float dist = sqrtf(dx * dx + dy2);
-
-                float oc = r_outer - dist + 0.5f;
-                if (oc <= 0.0f) continue;
-                if (oc > 1.0f)  oc = 1.0f;
-
-                float ic = r_inner - dist + 0.5f;
-                if (ic < 0.0f) ic = 0.0f;
-                if (ic > 1.0f) ic = 1.0f;
-
-                float ring = oc - ic;
-                if (ring <= 0.0f) continue;
-
-                /* premultiplied white: A=R=G=B */
-                unsigned a = (unsigned)(ring * 255.0f + 0.5f);
-                XPutPixel(img, x, y,
-                          ((unsigned long)a << 24) |
-                          ((unsigned long)a << 16) |
-                          ((unsigned long)a << 8)  |
-                           (unsigned long)a);
-            }
-        }
-    } else {
-        /* solid filled circle in the current colour */
-        float r = (float)brush_radius;
-        unsigned char cr = color_table[cur_color].ar;
-        unsigned char cg = color_table[cur_color].ag;
-        unsigned char cb = color_table[cur_color].ab;
-
-        for (int y = 0; y < d; y++) {
-            float dy  = y + 0.5f - center;
-            float dy2 = dy * dy;
-            for (int x = 0; x < d; x++) {
-                float dx   = x + 0.5f - center;
-                float dist = sqrtf(dx * dx + dy2);
-
-                float cov = r - dist + 0.5f;
-                if (cov <= 0.0f) continue;
-                if (cov > 1.0f)  cov = 1.0f;
-
-                /* premultiplied ARGB */
-                unsigned a  = (unsigned)(cov * 255.0f + 0.5f);
-                unsigned rr = (unsigned)(cov * cr + 0.5f);
-                unsigned gg = (unsigned)(cov * cg + 0.5f);
-                unsigned bb = (unsigned)(cov * cb + 0.5f);
-                XPutPixel(img, x, y,
-                          ((unsigned long)a  << 24) |
-                          ((unsigned long)rr << 16) |
-                          ((unsigned long)gg << 8)  |
-                           (unsigned long)bb);
-            }
-        }
+        XSetForeground(dpy, gc_cursor, 0);
+        XFillRectangle(dpy, cursor_win, gc_cursor, 0, 0,
+                       (unsigned)d, (unsigned)d);
+        XSetFont(dpy, gc_cursor, cursor_feedback_font->fid);
+        XSetForeground(dpy, gc_cursor, argb_pixel(0, 0, 0));
+        XDrawString(dpy, cursor_win, gc_cursor, x - 1, y, text, 1);
+        XDrawString(dpy, cursor_win, gc_cursor, x + 1, y, text, 1);
+        XDrawString(dpy, cursor_win, gc_cursor, x, y - 1, text, 1);
+        XDrawString(dpy, cursor_win, gc_cursor, x, y + 1, text, 1);
+        XSetForeground(dpy, gc_cursor, cursor_feedback_pixel);
+        XDrawString(dpy, cursor_win, gc_cursor, x, y, text, 1);
+        return;
     }
 
-    XPutImage(dpy, cursor_win, gc_cursor, img, 0, 0, 0, 0, d, d);
-    XDestroyImage(img);
+    {
+        float center = d * 0.5f;
+        XImage *img = XCreateImage(dpy, argb_visual, 32, ZPixmap,
+                                   0, NULL, d, d, 32, 0);
+        img->data = calloc((size_t)img->bytes_per_line * d, 1);
+
+        if (erase_mode) {
+            /* transparent inside, anti-aliased white ring outside */
+            float r_inner = (float)brush_radius;
+            float r_outer = (float)(brush_radius + ERASE_BORDER);
+
+            for (int y = 0; y < d; y++) {
+                float dy  = y + 0.5f - center;
+                float dy2 = dy * dy;
+                for (int x = 0; x < d; x++) {
+                    float dx   = x + 0.5f - center;
+                    float dist = sqrtf(dx * dx + dy2);
+
+                    float oc = r_outer - dist + 0.5f;
+                    if (oc <= 0.0f) continue;
+                    if (oc > 1.0f)  oc = 1.0f;
+
+                    float ic = r_inner - dist + 0.5f;
+                    if (ic < 0.0f) ic = 0.0f;
+                    if (ic > 1.0f) ic = 1.0f;
+
+                    float ring = oc - ic;
+                    if (ring <= 0.0f) continue;
+
+                    /* premultiplied white: A=R=G=B */
+                    unsigned a = (unsigned)(ring * 255.0f + 0.5f);
+                    XPutPixel(img, x, y,
+                              ((unsigned long)a << 24) |
+                              ((unsigned long)a << 16) |
+                              ((unsigned long)a << 8)  |
+                               (unsigned long)a);
+                }
+            }
+        } else {
+            /* solid filled circle in the current colour */
+            float r = (float)brush_radius;
+            unsigned char cr = color_table[cur_color].ar;
+            unsigned char cg = color_table[cur_color].ag;
+            unsigned char cb = color_table[cur_color].ab;
+
+            for (int y = 0; y < d; y++) {
+                float dy  = y + 0.5f - center;
+                float dy2 = dy * dy;
+                for (int x = 0; x < d; x++) {
+                    float dx   = x + 0.5f - center;
+                    float dist = sqrtf(dx * dx + dy2);
+
+                    float cov = r - dist + 0.5f;
+                    if (cov <= 0.0f) continue;
+                    if (cov > 1.0f)  cov = 1.0f;
+
+                    /* premultiplied ARGB */
+                    unsigned a  = (unsigned)(cov * 255.0f + 0.5f);
+                    unsigned rr = (unsigned)(cov * cr + 0.5f);
+                    unsigned gg = (unsigned)(cov * cg + 0.5f);
+                    unsigned bb = (unsigned)(cov * cb + 0.5f);
+                    XPutPixel(img, x, y,
+                              ((unsigned long)a  << 24) |
+                              ((unsigned long)rr << 16) |
+                              ((unsigned long)gg << 8)  |
+                               (unsigned long)bb);
+                }
+            }
+        }
+
+        XPutImage(dpy, cursor_win, gc_cursor, img, 0, 0, 0, 0, d, d);
+        XDestroyImage(img);
+    }
 }
 
 static void resize_cursor(void)
@@ -950,6 +1050,9 @@ int main(void)
         XShapeCombineRectangles(dpy, cursor_win, ShapeInput,
                                 0, 0, NULL, 0, ShapeSet, Unsorted);
         gc_cursor = XCreateGC(dpy, cursor_win, 0, NULL);
+        cursor_feedback_font = XLoadQueryFont(dpy, "10x20");
+        if (!cursor_feedback_font)
+            cursor_feedback_font = XLoadQueryFont(dpy, "fixed");
         XClassHint cch = { .res_name = "draw", .res_class = "draw" };
         XSetClassHint(dpy, cursor_win, &cch);
         has_cursor = 1;
@@ -1031,6 +1134,8 @@ int main(void)
     int xfd = ConnectionNumber(dpy);
 
     while (running) {
+        clear_cursor_feedback_if_needed();
+
         while (XPending(dpy) > 0 && running) {
             XEvent ev;
             XNextEvent(dpy, &ev);
@@ -1190,6 +1295,8 @@ int main(void)
     if (erase_clip_r >= 0)
         XFreePixmap(dpy, erase_clip);
     if (has_cursor) {
+        if (cursor_feedback_font)
+            XFreeFont(dpy, cursor_feedback_font);
         XFreeGC(dpy, gc_cursor);
         XDestroyWindow(dpy, cursor_win);
         XFreeColormap(dpy, argb_cmap);
