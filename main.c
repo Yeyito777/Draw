@@ -105,9 +105,12 @@ static int            undo_count;
 static CanvasSnapshot redo_stack[MAX_UNDO];
 static int            redo_count;
 
-/* Cached circular clip mask for the eraser */
+/* Cached circular brush mask shared by draw / erase / save-load */
 static Pixmap   erase_clip;
 static int      erase_clip_r = -1;  /* radius the clip was built for */
+static uint8_t *brush_mask;
+static int      brush_mask_r = -1;
+static int      brush_mask_d;
 
 /* ARGB cursor overlay */
 static Visual  *argb_visual;
@@ -858,27 +861,109 @@ static Cursor make_blank_cursor(void)
 }
 
 /* ── Drawing helpers ──────────────────────────────────────────── */
+static int update_brush_cache(void)
+{
+    XImage *mask_img;
+    GC mgc;
+    int d;
+
+    if (erase_clip_r == brush_radius && brush_mask_r == brush_radius)
+        return 1;
+
+    if (erase_clip_r >= 0)
+        XFreePixmap(dpy, erase_clip);
+    erase_clip_r = -1;
+
+    free(brush_mask);
+    brush_mask = NULL;
+    brush_mask_r = -1;
+    brush_mask_d = 0;
+
+    d = brush_radius * 2;
+    erase_clip = XCreatePixmap(dpy, canvas, d, d, 1);
+    mgc = XCreateGC(dpy, erase_clip, 0, NULL);
+    XSetForeground(dpy, mgc, 0);
+    XFillRectangle(dpy, erase_clip, mgc, 0, 0, d, d);
+    XSetForeground(dpy, mgc, 1);
+    XFillArc(dpy, erase_clip, mgc, 0, 0, d, d, 0, 360 * 64);
+    XFreeGC(dpy, mgc);
+
+    XSetClipMask(dpy, gc_erase, erase_clip);
+    erase_clip_r = brush_radius;
+
+    mask_img = XGetImage(dpy, erase_clip, 0, 0, d, d, AllPlanes, ZPixmap);
+    if (!mask_img) {
+        fprintf(stderr, "draw: failed to build brush mask\n");
+        return 0;
+    }
+
+    brush_mask = malloc((size_t)d * (size_t)d);
+    if (!brush_mask) {
+        fprintf(stderr, "draw: out of memory building brush mask\n");
+        XDestroyImage(mask_img);
+        return 0;
+    }
+
+    for (int my = 0; my < d; my++) {
+        size_t row = (size_t)my * (size_t)d;
+        for (int mx = 0; mx < d; mx++)
+            brush_mask[row + (size_t)mx] = XGetPixel(mask_img, mx, my) ? 1u : 0u;
+    }
+
+    XDestroyImage(mask_img);
+    brush_mask_r = brush_radius;
+    brush_mask_d = d;
+    return 1;
+}
+
 static void overlay_paint_circle(int x, int y, uint8_t value)
 {
-    int r = brush_radius;
-    int min_x = x - r;
-    int max_x = x + r;
-    int min_y = y - r;
-    int max_y = y + r;
-    int rr = r * r;
+    if (!update_brush_cache()) {
+        int r = brush_radius;
+        int min_x = x - r;
+        int max_x = x + r;
+        int min_y = y - r;
+        int max_y = y + r;
+        int rr = r * r;
 
-    if (min_x < 0) min_x = 0;
-    if (min_y < 0) min_y = 0;
-    if (max_x >= scr_w) max_x = scr_w - 1;
-    if (max_y >= scr_h) max_y = scr_h - 1;
+        if (min_x < 0) min_x = 0;
+        if (min_y < 0) min_y = 0;
+        if (max_x >= scr_w) max_x = scr_w - 1;
+        if (max_y >= scr_h) max_y = scr_h - 1;
 
-    for (int py = min_y; py <= max_y; py++) {
-        int dy = py - y;
-        size_t row = (size_t)py * (size_t)scr_w;
-        for (int px = min_x; px <= max_x; px++) {
-            int dx = px - x;
-            if (dx * dx + dy * dy <= rr)
-                overlay_map[row + (size_t)px] = value;
+        for (int py = min_y; py <= max_y; py++) {
+            int dy = py - y;
+            size_t row = (size_t)py * (size_t)scr_w;
+            for (int px = min_x; px <= max_x; px++) {
+                int dx = px - x;
+                if (dx * dx + dy * dy <= rr)
+                    overlay_map[row + (size_t)px] = value;
+            }
+        }
+        return;
+    }
+
+    {
+        int ox = x - brush_radius;
+        int oy = y - brush_radius;
+        int d = brush_mask_d;
+
+        for (int my = 0; my < d; my++) {
+            int py = oy + my;
+            size_t src_row = (size_t)my * (size_t)d;
+            size_t dst_row;
+
+            if (py < 0 || py >= scr_h)
+                continue;
+            dst_row = (size_t)py * (size_t)scr_w;
+
+            for (int mx = 0; mx < d; mx++) {
+                int px = ox + mx;
+                if (px < 0 || px >= scr_w)
+                    continue;
+                if (brush_mask[src_row + (size_t)mx] != 0)
+                    overlay_map[dst_row + (size_t)px] = value;
+            }
         }
     }
 }
@@ -910,22 +995,7 @@ static void brush_stroke(int x0, int y0, int x1, int y1)
 
 static void update_erase_clip(void)
 {
-    if (erase_clip_r == brush_radius) return;
-
-    if (erase_clip_r >= 0)
-        XFreePixmap(dpy, erase_clip);
-
-    int d = brush_radius * 2;
-    erase_clip = XCreatePixmap(dpy, canvas, d, d, 1);
-    GC mgc = XCreateGC(dpy, erase_clip, 0, NULL);
-    XSetForeground(dpy, mgc, 0);
-    XFillRectangle(dpy, erase_clip, mgc, 0, 0, d, d);
-    XSetForeground(dpy, mgc, 1);
-    XFillArc(dpy, erase_clip, mgc, 0, 0, d, d, 0, 360 * 64);
-    XFreeGC(dpy, mgc);
-
-    XSetClipMask(dpy, gc_erase, erase_clip);
-    erase_clip_r = brush_radius;
+    (void)update_brush_cache();
 }
 
 static void erase_stamp(int x, int y)
@@ -1292,6 +1362,7 @@ int main(void)
     XFreeGC(dpy, gc_draw);
     XFreeGC(dpy, gc_copy);
     XFreeGC(dpy, gc_erase);
+    free(brush_mask);
     if (erase_clip_r >= 0)
         XFreePixmap(dpy, erase_clip);
     if (has_cursor) {
